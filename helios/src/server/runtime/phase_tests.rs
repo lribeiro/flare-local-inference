@@ -149,7 +149,7 @@ impl Fixture {
             },
             frontend,
             stop: AtomicBool::new(false),
-            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16, 0)),
         }
     }
 
@@ -239,6 +239,7 @@ impl Fixture {
             Incoming {
                 _capacity: None,
                 arrival_ns: super::super::observation::monotonic_ns(),
+                metrics_ingress_ns: None,
                 publications: Default::default(),
                 prompt: Self::prompt_for(tokens, limit, data),
                 events,
@@ -3136,7 +3137,7 @@ fn unread_responses_finish_and_release_model_resources_but_retain_admission_capa
         let mut slow_prompt = prompt(512);
         slow_prompt.logprobs = logprobs;
         slow_prompt.stop_sequences = vec![vec![2, 3]];
-        let mut slow = runtime.generate_observed(slow_prompt, true).unwrap();
+        let mut slow = runtime.generate_observed(slow_prompt, true, None).unwrap();
         let mut worker = fixture.worker(receiver);
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         let mut tokens = vec![1; 512];
@@ -3150,11 +3151,11 @@ fn unread_responses_finish_and_release_model_resources_but_retain_admission_capa
 
         // A completed response whose reader is paused cannot hold a model slot
         // or prevent another admitted request from producing its answer.
-        let mut fast = runtime.generate(prompt(2)).unwrap();
+        let mut fast = runtime.generate(prompt(2), None).unwrap();
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         budget_pass(&mut worker, &mut sequence, &[3, 1]);
         assert_eq!(budget_events(&mut fast).0, vec![3, 1]);
-        assert!(runtime.generate(prompt(1)).is_err());
+        assert!(runtime.generate(prompt(1), None).is_err());
         drop(fast);
         assert_eq!(runtime.capacity.available_permits(), 1);
 
@@ -3190,7 +3191,7 @@ fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
         positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
     });
     prompt.reasoning_cut = Some(budget_cut(4, 81));
-    let mut generation = runtime.generate_observed(prompt, false).unwrap();
+    let mut generation = runtime.generate_observed(prompt, false, None).unwrap();
     let mut worker = fixture.worker(receiver);
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let mut sequence = 0;
@@ -3223,19 +3224,19 @@ fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacit
     let good = prompt();
     let mut bad = prompt();
     bad.tokens.clear();
-    assert!(runtime.generate_many(vec![good, bad]).is_err());
+    assert!(runtime.generate_many(vec![good, bad], None).is_err());
     assert!(matches!(
         receiver.try_recv(),
         Err(mpsc::TryRecvError::Empty)
     ));
     assert_eq!(runtime.capacity.available_permits(), 4);
     let prompts = (0..3).map(|_| prompt()).collect();
-    let generations = runtime.generate_many(prompts).unwrap();
+    let generations = runtime.generate_many(prompts, None).unwrap();
     let group = receiver.try_recv().unwrap();
     assert_eq!(group.len(), 3);
     assert_eq!(runtime.capacity.available_permits(), 1);
     let prompts = (0..2).map(|_| prompt()).collect();
-    assert!(runtime.generate_many(prompts).is_err());
+    assert!(runtime.generate_many(prompts, None).is_err());
     assert!(matches!(
         receiver.try_recv(),
         Err(mpsc::TryRecvError::Empty)
@@ -4288,7 +4289,7 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
     let state = http_state(sender, Some("serving-key".into()));
-    state.model.metrics().progress(10, 3, 0, 0, 0, 0);
+    state.model.metrics().progress(10, 3, 0, 0, 0, 0, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = super::super::router(state, &[], 65536);
@@ -4328,6 +4329,8 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         "{body}"
     );
     assert!(body.contains("\nflare_prefill_tokens_total 10\n"));
+    assert!(body.contains("\nflare_time_to_first_token_seconds_count 0\n"));
+    assert!(body.contains("\nflare_request_success_total{finished_reason=\"stop\"} 0\n"));
     for (path, accept) in [
         ("/metrics", Some("application/json")),
         ("/metrics?format=json", Some("text/plain")),
@@ -4493,6 +4496,11 @@ fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
         reused_prompt_tokens: Some(56),
         generated_tokens: 7,
         seed: Some(99),
+        admitted_ns: None,
+        first_token_ns: None,
+        last_token_ns: None,
+        preemptions: 0,
+        prompt_observed: false,
     };
     worker.active[0].as_mut().unwrap().last_token = Some(2);
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
