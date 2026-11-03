@@ -116,6 +116,17 @@ Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf'
 sudo apt-get install build-essential cmake ninja-build pkg-config protobuf-compiler libssl-dev python3-dev liburing-dev
 ```
 
+The `make deps` target runs that install and also installs uv with its
+standalone installer (`https://astral.sh/uv/install.sh`) when uv is not
+already on `PATH`. `make deps` likewise installs Rust through rustup's
+installer (`https://sh.rustup.rs`, minimal profile) when `cargo` is
+missing, because Flare requires Rust 1.88 or newer and Ubuntu's apt
+`cargo` is older. A fresh uv install lands in `~/.local/bin` and a fresh
+rustup install in `~/.cargo/bin`; Makefile targets search both, so `make`
+works in the same shell that ran `make deps`. Only direct shell
+invocations of `uv` or `cargo` need a new shell, `~/.local/bin` on
+`PATH`, or `. $HOME/.cargo/env`.
+
 Windows native builds also require Perl for the bundled static OpenSSL build,
 alongside the C/C++ toolchain. The resulting binaries do not require OpenSSL DLLs.
 
