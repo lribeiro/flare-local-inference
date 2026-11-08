@@ -58,6 +58,28 @@ impl Prompt {
     fn has_host_stops(&self) -> bool {
         !self.stop_sequences.is_empty() || !self.stop_strings.is_empty()
     }
+
+    fn output_event_capacity(&self, minimum: usize, observed: bool) -> Result<usize> {
+        // Each generated token produces at most one presentation event and one
+        // optional observation. A reasoning cut's forced token is part of `after`.
+        // Prompt-score chunks cover disjoint, nonempty ranges of the original prompt.
+        let tokens = u64::from(self.max_new_tokens)
+            + u64::from(self.reasoning_cut.as_ref().map_or(0, |cut| cut.after));
+        let events = usize::try_from(tokens)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(if observed { 2 } else { 1 }))
+            .and_then(|events| {
+                events.checked_add(if self.prompt_logprobs { self.tokens.len() } else { 0 })
+            })
+            // Text-stop flush, terminal completion, and the first failure.
+            .and_then(|events| events.checked_add(3))
+            .map(|events| events.max(minimum))
+            .filter(|events| *events <= tokio::sync::Semaphore::MAX_PERMITS)
+            .ok_or_else(|| {
+                Error::admission(AdmissionError::Invalid, "output event budget is too large")
+            })?;
+        Ok(events)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +106,9 @@ pub enum GenerationEvent {
 
 pub struct Generation {
     pub events: async_mpsc::Receiver<GenerationEvent>,
+    // Finished responses still consume host admission capacity until their reader
+    // releases them. GPU request slots and cache pages have a separate lifetime.
+    _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     admission: oneshot::Receiver<Result<()>>,
     /// Completes before stop matching or decoding can hide the first token.
     first_token: oneshot::Receiver<Result<()>>,
@@ -92,8 +117,8 @@ pub struct Generation {
     pub(super) enqueue_ns: Option<u64>,
 }
 
-/// A buffered group waits for one admission. Waiting for every choice would
-/// leave admitted choices' bounded output queues undrained.
+/// A buffered group starts consuming output after one choice is admitted;
+/// other choices may still be waiting for model capacity.
 pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()> {
     use std::{future::Future, pin::Pin, task::Poll};
     std::future::poll_fn(|cx| {
@@ -152,6 +177,8 @@ impl Drop for Generation {
 struct Incoming {
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     arrival_ns: u64,
+    /// HTTP handler start, used only for metrics. Scheduling keeps `arrival_ns`.
+    metrics_ingress_ns: Option<u64>,
     publications: std::cell::Cell<u64>,
     prompt: Prompt,
     events: async_mpsc::Sender<GenerationEvent>,
@@ -269,20 +296,32 @@ impl Incoming {
             });
         }
     }
-    fn emit(&self, event: GenerationEvent) {
+    fn emit(&self, event: GenerationEvent) -> bool {
         let publishes = matches!(
             &event,
             GenerationEvent::Token(_) | GenerationEvent::LogprobToken(_) | GenerationEvent::Protocol(_)
         );
-        if self.events.try_send(event).is_err() {
-            self.fail(Error::execution(
-                ExecutionError::Capacity,
-                "generation consumer exceeded the bounded output queue",
-            ));
-            self.cancelled.store(true, Ordering::Release);
-        } else if publishes {
-            self.publications
-                .set(self.publications.get().saturating_add(1));
+        match self.events.try_send(event) {
+            Ok(()) if publishes => {
+                self.publications
+                    .set(self.publications.get().saturating_add(1));
+                true
+            }
+            Ok(()) => true,
+            Err(async_mpsc::error::TrySendError::Closed(_)) => {
+                self.cancelled.store(true, Ordering::Release);
+                false
+            }
+            Err(async_mpsc::error::TrySendError::Full(_)) => {
+                // Admission budgets the complete response, so a full queue is a
+                // producer invariant violation, not a slow or disconnected reader.
+                self.fail(Error::execution(
+                    ExecutionError::Completion,
+                    "generation exceeded its output event budget",
+                ));
+                self.cancelled.store(true, Ordering::Release);
+                false
+            }
         }
     }
 }
@@ -311,6 +350,11 @@ struct Carried {
     generated_tokens: u32,
     /// The request's own sampling seed, from which each continuation's seed derives.
     seed: Option<u64>,
+    admitted_ns: Option<u64>,
+    first_token_ns: Option<u64>,
+    last_token_ns: Option<u64>,
+    preemptions: u32,
+    prompt_observed: bool,
 }
 
 /// The sampling seed of a preempted request's continuation after `generated` tokens.
@@ -438,13 +482,13 @@ impl ModelRuntime {
         let worker_config = config.clone();
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
         let worker_finished = finished.clone();
-        let mut metrics =
-            super::metrics::Metrics::new(
-                config.limits.pages,
-                config.contract.cache.page_tokens,
-                config.decode_weight_bytes,
-                config.completion_token_capacity,
-            );
+        let mut metrics = super::metrics::Metrics::new(
+            config.limits.pages,
+            config.contract.cache.page_tokens,
+            config.decode_weight_bytes,
+            config.completion_token_capacity,
+            config.limits.max_sequence_tokens as u64,
+        );
         metrics.history_drafts = config.history_drafts;
         metrics.engram = manifest
             .engram
@@ -700,31 +744,51 @@ impl ModelRuntime {
             .wait_timeout_while(finished, timeout, |finished| !*finished);
         self.healthy()
     }
-    pub fn generate(&self, prompt: Prompt) -> Result<Generation> {
-        self.enqueue(prompt, None)
+    pub fn generate(&self, prompt: Prompt, ingress_ns: Option<u64>) -> Result<Generation> {
+        self.enqueue(prompt, None, ingress_ns)
     }
 
-    pub(super) fn generate_observed(&self, prompt: Prompt, timestamps: bool) -> Result<Generation> {
-        self.enqueue(prompt, Some(timestamps))
+    pub(super) fn generate_observed(
+        &self,
+        prompt: Prompt,
+        timestamps: bool,
+        ingress_ns: Option<u64>,
+    ) -> Result<Generation> {
+        self.enqueue(prompt, Some(timestamps), ingress_ns)
     }
 
-    fn enqueue(&self, prompt: Prompt, observation: Option<bool>) -> Result<Generation> {
-        self.enqueue_many(vec![prompt], observation)
+    fn enqueue(
+        &self,
+        prompt: Prompt,
+        observation: Option<bool>,
+        ingress_ns: Option<u64>,
+    ) -> Result<Generation> {
+        self.enqueue_many(vec![prompt], observation, ingress_ns)
             .map(|mut group| group.remove(0))
     }
 
-    pub fn generate_many(&self, prompts: Vec<Prompt>) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, None)
+    pub fn generate_many(
+        &self,
+        prompts: Vec<Prompt>,
+        ingress_ns: Option<u64>,
+    ) -> Result<Vec<Generation>> {
+        self.enqueue_many(prompts, None, ingress_ns)
     }
 
-    pub(super) fn generate_many_observed(&self, prompts: Vec<Prompt>, timestamps: bool) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, Some(timestamps))
+    pub(super) fn generate_many_observed(
+        &self,
+        prompts: Vec<Prompt>,
+        timestamps: bool,
+        ingress_ns: Option<u64>,
+    ) -> Result<Vec<Generation>> {
+        self.enqueue_many(prompts, Some(timestamps), ingress_ns)
     }
 
     fn enqueue_many(
         &self,
         prompts: Vec<Prompt>,
         observation: Option<bool>,
+        ingress_ns: Option<u64>,
     ) -> Result<Vec<Generation>> {
         if !self.healthy() {
             return Err(Error::admission(
@@ -765,7 +829,10 @@ impl ModelRuntime {
             )?;
             crate::model::admission::validate_prompt(&self.config, &prompt)
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
-            let (events, receiver) = async_mpsc::channel(self.event_capacity);
+            // Tokio allocates queue blocks as events arrive, not at this capacity.
+            let event_capacity =
+                prompt.output_event_capacity(self.event_capacity, observation.is_some())?;
+            let (events, receiver) = async_mpsc::channel(event_capacity);
             let (admission, admitted) = oneshot::channel();
             let (first_token, first_token_ready) = oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -773,6 +840,7 @@ impl ModelRuntime {
             let incoming = Incoming {
                 _capacity: Some(capacity.clone()),
                 arrival_ns: super::observation::monotonic_ns(),
+                metrics_ingress_ns: ingress_ns,
                 publications: Default::default(),
                 prompt_score_end: if prompt.prompt_logprobs { prompt.tokens.len() } else { 0 },
                 prompt_scored: 0,
@@ -798,6 +866,7 @@ impl ModelRuntime {
             incoming_group.push(incoming);
             generations.push(Generation {
                 events: receiver,
+                _capacity: Some(capacity.clone()),
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -1378,6 +1447,14 @@ impl<'a> Worker<'a> {
                 incoming.pool_plan = None;
             }
             incoming.notify_admission(Ok(()));
+            let admitted_ns = super::observation::monotonic_ns();
+            let live = self.scheduler.request(handle)?;
+            let mut carried = parked.carried;
+            carried.admitted_ns.get_or_insert(admitted_ns);
+            carried.prompt_tokens.get_or_insert(live.prompt_tokens);
+            carried
+                .reused_prompt_tokens
+                .get_or_insert_with(|| live.reused_prompt_tokens());
             self.active[slot] = Some(Active {
                 request: handle,
                 stops: parked.stops,
@@ -1387,7 +1464,7 @@ impl<'a> Worker<'a> {
                 next_image: 0,
                 selected_images,
                 prepared_image: None,
-                carried: parked.carried,
+                carried,
                 held_logprobs: parked.held_logprobs,
                 reasoning: parked.reasoning,
             });
@@ -1442,8 +1519,8 @@ impl<'a> Worker<'a> {
         kind: GraphKind,
         mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
-        self.scheduler
-            .advance_to(super::observation::monotonic_ns())?;
+        let completion_ns = super::observation::monotonic_ns();
+        self.scheduler.advance_to(completion_ns)?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
         let selection = self.scheduler.submitted_timing(completion.fence)?;
         if measured_step.kind != kind {
@@ -1468,6 +1545,7 @@ impl<'a> Worker<'a> {
         let mut draft_rounds = 0;
         let mut verification_drafts = 0;
         let mut verification_rounds = 0;
+        let mut offered_total = 0;
         if matches!(
             kind,
             GraphKind::Prefill
@@ -1497,6 +1575,7 @@ impl<'a> Worker<'a> {
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
                         verification_drafts += offered as u64;
                         if offered > 0 {
+                            offered_total += offered as u64;
                             accepted += (vector.accepted_drafts as usize).min(offered) as u64;
                             draft_rounds += 1;
                         }
@@ -1516,9 +1595,19 @@ impl<'a> Worker<'a> {
                 completion.speculative_survival.as_ref().map(|rows| rows.as_slice()),
             )?
         };
-        self.metrics
-            .progress(prefill, generated.len(), accepted, draft_rounds,
-                verification_drafts, verification_rounds);
+        self.metrics.progress(
+            prefill,
+            generated.len(),
+            accepted,
+            draft_rounds,
+            verification_drafts,
+            verification_rounds,
+            offered_total,
+        );
+        if kind.samples() {
+            self.metrics
+                .iteration_tokens(prefill + generated.len() as u64);
+        }
         self.metrics.replay_completed(completion.timing);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1568,11 +1657,9 @@ impl<'a> Worker<'a> {
                 }).collect::<Result<Vec<_>>>()?;
                 if first < end {
                     request.incoming.prompt_scored = end;
-                    if request.incoming.events.try_send(GenerationEvent::PromptLogprobs {
+                    request.incoming.emit(GenerationEvent::PromptLogprobs {
                         start: first, tokens: prompt.tokens[first..end].to_vec(), values,
-                    }).is_err() {
-                        request.incoming.cancelled.store(true, Ordering::Release);
-                    }
+                    });
                 }
             }
         }
@@ -1589,6 +1676,30 @@ impl<'a> Worker<'a> {
                 .as_mut()
                 .filter(|a| a.request == token.request)
             {
+                if position == 0 {
+                    let prompt = request
+                        .carried
+                        .prompt_tokens
+                        .unwrap_or(request.incoming.prompt.tokens.len())
+                        as u64;
+                    let cached = request.carried.reused_prompt_tokens.unwrap_or(0);
+                    if request.carried.first_token_ns.is_none() {
+                        request.carried.first_token_ns = Some(completion_ns);
+                        if !request.carried.prompt_observed {
+                            self.metrics.prompt_tokens(prompt, cached);
+                            request.carried.prompt_observed = true;
+                        }
+                        let ingress = request
+                            .incoming
+                            .metrics_ingress_ns
+                            .unwrap_or(request.incoming.arrival_ns);
+                        self.metrics
+                            .first_token(completion_ns.saturating_sub(ingress));
+                    } else if let Some(last) = request.carried.last_token_ns {
+                        self.metrics.inter_token(completion_ns.saturating_sub(last));
+                    }
+                    request.carried.last_token_ns = Some(completion_ns);
+                }
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
                 if let Some(reasoning) = &mut request.reasoning {
@@ -1652,32 +1763,33 @@ impl<'a> Worker<'a> {
                 if stop {
                     self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                     let live = self.scheduler.request(token.request)?;
-                    if request
-                        .incoming
-                        .events
-                        .try_send(GenerationEvent::Finished {
-                            prompt_tokens: request
-                                .carried
-                                .prompt_tokens
-                                .unwrap_or(live.prompt_tokens),
-                            generated_tokens: request.carried.generated_tokens
-                                + live.generated_tokens,
-                            reused_prompt_tokens: request
-                                .carried
-                                .reused_prompt_tokens
-                                .unwrap_or(live.reused_prompt_tokens()),
-                            reason: "stop",
-                            termination: crate::output::Termination::UserStop,
-                            stop_sequence: request
-                                .text_stops
-                                .as_ref()
-                                .and_then(|s| s.matched().map(str::to_owned)),
-                        })
-                        .is_err()
-                    {
-                        request
-                            .incoming
-                            .fail("generation consumer exceeded the bounded output queue".into());
+                    let prompt_tokens = request.carried.prompt_tokens.unwrap_or(live.prompt_tokens);
+                    let generated_tokens = request.carried.generated_tokens + live.generated_tokens;
+                    let reused_prompt_tokens = request
+                        .carried
+                        .reused_prompt_tokens
+                        .unwrap_or(live.reused_prompt_tokens());
+                    let finished_ns = super::observation::monotonic_ns();
+                    if request.incoming.emit(GenerationEvent::Finished {
+                        prompt_tokens,
+                        generated_tokens: generated_tokens as u32,
+                        reused_prompt_tokens,
+                        reason: "stop",
+                        termination: crate::output::Termination::UserStop,
+                        stop_sequence: request
+                            .text_stops
+                            .as_ref()
+                            .and_then(|s| s.matched().map(str::to_owned)),
+                    }) {
+                        record_finished(
+                            &self.metrics,
+                            request,
+                            prompt_tokens as u64,
+                            reused_prompt_tokens,
+                            generated_tokens as u64,
+                            "stop",
+                            finished_ns,
+                        );
                     }
                     stopped.push(token.request);
                 }
@@ -1762,7 +1874,7 @@ impl<'a> Worker<'a> {
                                 self.metrics
                                     .reasoning_budget_cuts
                                     .fetch_add(1, Ordering::Relaxed);
-                                self.metrics.progress(0, 1, 0, 0, 0, 0);
+                                self.metrics.progress(0, 1, 0, 0, 0, 0, 0);
                             }
                             if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
                                 self.scheduler.cancel(request.request)?;
@@ -1808,59 +1920,52 @@ impl<'a> Worker<'a> {
                         } || budget_stop;
                         self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                         for token in request.stops.finish() {
-                            if request
+                            request
                                 .incoming
-                                .events
-                                .try_send(match request.held_logprobs.pop_front().flatten() {
+                                .emit(match request.held_logprobs.pop_front().flatten() {
                                     Some(value) => GenerationEvent::LogprobToken(value),
                                     None => GenerationEvent::Token(token),
-                                })
-                                .is_err()
-                            {
-                                request.incoming.fail(
-                                    "generation consumer exceeded the bounded output queue".into(),
-                                );
-                            }
+                                });
                         }
-                        let reason = if user_stop
-                            || request
+                        let eos = !request.incoming.prompt.ignore_eos
+                            && request
                                 .last_token
-                                .is_some_and(|token| self.config.eos_token_ids.contains(&token))
-                        {
-                            "stop"
-                        } else {
-                            "length"
-                        };
-                        if request
-                            .incoming
-                            .events
-                            .try_send(GenerationEvent::Finished {
-                                prompt_tokens: request
-                                    .carried
-                                    .prompt_tokens
-                                    .unwrap_or(prompt_tokens),
-                                generated_tokens: request.carried.generated_tokens + generated,
-                                reused_prompt_tokens: request
-                                    .carried
-                                    .reused_prompt_tokens
-                                    .unwrap_or(reused),
+                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
+                        let reason = if user_stop || eos { "stop" } else { "length" };
+                        let prompt_tokens =
+                            request.carried.prompt_tokens.unwrap_or(prompt_tokens);
+                        let generated_tokens =
+                            request.carried.generated_tokens + generated;
+                        let reused_prompt_tokens = request
+                            .carried
+                            .reused_prompt_tokens
+                            .unwrap_or(reused);
+                        let finished_ns = super::observation::monotonic_ns();
+                        if request.incoming.emit(GenerationEvent::Finished {
+                            prompt_tokens,
+                            generated_tokens,
+                            reused_prompt_tokens,
+                            reason,
+                            stop_sequence: request
+                                .text_stops
+                                .as_ref()
+                                .and_then(|s| s.matched().map(str::to_owned)),
+                            termination: if user_stop {
+                                crate::output::Termination::UserStop
+                            } else if reason == "stop" {
+                                crate::output::Termination::Eos
+                            } else {
+                                crate::output::Termination::OutputLimit
+                            },
+                        }) {
+                            record_finished(
+                                &self.metrics,
+                                request,
+                                prompt_tokens as u64,
+                                reused_prompt_tokens,
+                                generated_tokens as u64,
                                 reason,
-                                stop_sequence: request
-                                    .text_stops
-                                    .as_ref()
-                                    .and_then(|s| s.matched().map(str::to_owned)),
-                                termination: if user_stop {
-                                    crate::output::Termination::UserStop
-                                } else if reason == "stop" {
-                                    crate::output::Termination::Eos
-                                } else {
-                                    crate::output::Termination::OutputLimit
-                                },
-                            })
-                            .is_err()
-                        {
-                            request.incoming.fail(
-                                "generation consumer exceeded the bounded output queue".into(),
+                                finished_ns,
                             );
                         }
                         if user_stop {
@@ -1943,6 +2048,11 @@ impl<'a> Worker<'a> {
                 reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(reused)),
                 generated_tokens,
                 seed: Some(seed),
+                admitted_ns: active.carried.admitted_ns,
+                first_token_ns: active.carried.first_token_ns,
+                last_token_ns: active.carried.last_token_ns,
+                preemptions: active.carried.preemptions + 1,
+                prompt_observed: active.carried.prompt_observed,
             },
         };
         self.parked.push_back((incoming, parked));
@@ -2577,6 +2687,33 @@ fn admit_with_host_store(
     result
 }
 
+fn record_finished(
+    metrics: &super::metrics::Metrics,
+    request: &Active<'_>,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    generated_tokens: u64,
+    reason: &'static str,
+    finished_ns: u64,
+) {
+    metrics.request_finished(super::metrics::RequestTiming {
+        ingress_ns: request
+            .incoming
+            .metrics_ingress_ns
+            .unwrap_or(request.incoming.arrival_ns),
+        arrival_ns: request.incoming.arrival_ns,
+        admitted_ns: request.carried.admitted_ns,
+        first_token_ns: request.carried.first_token_ns,
+        last_token_ns: request.carried.last_token_ns,
+        finished_ns,
+        prompt_tokens,
+        cached_tokens,
+        generated_tokens,
+        preemptions: request.carried.preemptions as u64,
+        reason,
+    });
+}
+
 fn cancel_stopped(
     stopped: &[RequestHandle],
     scheduler: &mut RequestScheduler,
@@ -2830,7 +2967,7 @@ mod tests {
             step
         }
 
-        let metrics = super::super::metrics::Metrics::new(0, 0, 0, 16);
+        let metrics = super::super::metrics::Metrics::new(0, 0, 0, 16, 0);
         let mut scheduler = RequestScheduler::new(
             [5; 32],
             SchedulerLimits {
@@ -2935,6 +3072,7 @@ mod tests {
         let incoming = Incoming {
             _capacity: None,
             arrival_ns: super::super::observation::monotonic_ns(),
+            metrics_ingress_ns: None,
             publications: Default::default(),
             prompt: Prompt {
                 tokens: vec![7],
@@ -2962,7 +3100,7 @@ mod tests {
             first_token: std::cell::Cell::new(Some(first_token)),
             cancelled: cancelled.clone(),
             failure: failure.clone(),
-            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16, 0)),
             observation: None,
             host_lookup: true,
             readmitted: false,
@@ -2978,6 +3116,7 @@ mod tests {
             incoming,
             Generation {
                 events: receiver,
+                _capacity: None,
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -2985,6 +3124,22 @@ mod tests {
                 enqueue_ns: None,
             },
         )
+    }
+
+    #[test]
+    fn response_event_budget_covers_observation_scores_and_reasoning_continuation() {
+        let (mut incoming, _generation) = stream(2);
+        let prompt = &mut incoming.prompt;
+        prompt.max_new_tokens = 1_000_000;
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 1_000_003);
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_003);
+        prompt.reasoning_cut = Some(ReasoningCut { close: 8, after: 20, output: None });
+        prompt.prompt_logprobs = true;
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_044);
+        prompt.max_new_tokens = 0;
+        prompt.reasoning_cut = None;
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 128);
+        assert!(prompt.output_event_capacity(usize::MAX, true).is_err());
     }
 
     #[test]
@@ -3474,7 +3629,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_output_cancels_without_blocking_and_preserves_first_failure() {
+    fn an_undersized_event_budget_cancels_and_preserves_the_first_failure() {
         let (incoming, mut generation) = stream(2);
         incoming.emit_token(11);
         incoming.emit_token(12);
@@ -3486,7 +3641,7 @@ mod tests {
         assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 1);
         assert_eq!(
             generation.failure().to_string(),
-            "generation consumer exceeded the bounded output queue"
+            "generation exceeded its output event budget"
         );
         assert!(matches!(
             generation.events.try_recv(),
@@ -3553,7 +3708,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_timestamps_are_monotonic_and_backpressure_remains_bounded() {
+    fn observation_timestamps_are_monotonic_and_count_toward_the_event_budget() {
         let (mut incoming, mut generation) = stream(2);
         incoming.observation = Some(true);
         let start = super::super::observation::monotonic_ns();
@@ -3576,22 +3731,19 @@ mod tests {
         }
         assert!(matches!(
             generation.failure(),
-            Error::Execution(ExecutionError::Capacity(_))
+            Error::Execution(ExecutionError::Completion(_))
         ));
     }
 
     #[test]
-    fn disconnected_output_marks_cancellation_and_retains_failure_for_the_reader() {
+    fn disconnected_output_cancels_without_reporting_an_execution_failure() {
         let (incoming, generation) = stream(2);
         let failure = generation.failure.clone();
         drop(generation);
         assert!(incoming.cancelled.load(Ordering::Acquire));
         incoming.emit_token(11);
-        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            failure.lock().unwrap().as_ref().unwrap(),
-            Error::Execution(ExecutionError::Capacity(_))
-        ));
+        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 0);
+        assert!(failure.lock().unwrap().is_none());
     }
 
     #[test]
