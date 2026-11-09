@@ -120,7 +120,7 @@ impl Responses {
                 .collect();
             let result = self
                 .runtime
-                .generate_many(slots.iter().map(|_| Self::prompt()).collect());
+                .generate_many(slots.iter().map(|_| Self::prompt()).collect(), None);
             if kind == 8 {
                 assert!(
                     matches!(result, Err(Error::Admission(AdmissionError::Capacity(_)))),
